@@ -6,48 +6,33 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/util/homedir"
 )
 
 func main() {
-	// Initialize the Kubernetes client
 	clientset, config, err := initializeClient()
 	if err != nil {
 		log.Fatalf("Error initializing Kubernetes client: %v", err)
 	}
 
-	// Setup HTTP server and register handler
 	http.HandleFunc("/exec-command", handleExecCommand(clientset, config))
-
-	// Start the server
 	log.Println("Starting server on port 8080...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Failed to start HTTP server: %v", err)
 	}
 }
 
-// initializeClient creates a Kubernetes clientset based on the kubeconfig file.
+// initializeClient sets up the Kubernetes client using in-cluster configuration
 func initializeClient() (*kubernetes.Clientset, *rest.Config, error) {
-	var kubeconfig string
-	if home := homedir.HomeDir(); home != "" {
-		kubeconfig = filepath.Join(home, ".kube", "config")
-	} else {
-		kubeconfig = os.Getenv("KUBECONFIG") // Assume environment variable if not found in home
-	}
-
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := rest.InClusterConfig()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to build kubeconfig: %v", err)
+		return nil, nil, fmt.Errorf("failed to build in-cluster config: %v", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -58,23 +43,23 @@ func initializeClient() (*kubernetes.Clientset, *rest.Config, error) {
 	return clientset, config, nil
 }
 
-// fetchPodByName retrieves the first pod based on label selector in the specified namespace.
-func fetchPodByName(clientset *kubernetes.Clientset, namespace, labelSelector string) (string, error) {
+// fetchPodByName finds the first pod matching the label selector in the specified namespace
+func fetchPodByName(clientset *kubernetes.Clientset, namespace, labelSelector string) (*corev1.Pod, error) {
 	pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
 		LabelSelector: labelSelector,
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch pods: %v", err)
+		return nil, fmt.Errorf("failed to fetch pods: %v", err)
 	}
 	if len(pods.Items) == 0 {
-		return "", fmt.Errorf("no pods found with the label selector '%s' in the namespace '%s'", labelSelector, namespace)
+		return nil, fmt.Errorf("no pods found with the label selector '%s' in the namespace '%s'", labelSelector, namespace)
 	}
 
-	return pods.Items[0].Name, nil // Assumes the first pod is the target
+	return &pods.Items[0], nil
 }
 
-// execCommandInPod executes a command in a specific pod and returns the output.
-func execCommandInPod(clientset *kubernetes.Clientset, config *rest.Config, namespace, podName string, command []string) (string, error) {
+// execCommandInPod runs a specified command in a pod/container within the given namespace
+func execCommandInPod(clientset *kubernetes.Clientset, config *rest.Config, namespace, podName, containerName string, command []string) (string, error) {
 	req := clientset.CoreV1().RESTClient().
 		Post().
 		Resource("pods").
@@ -82,11 +67,12 @@ func execCommandInPod(clientset *kubernetes.Clientset, config *rest.Config, name
 		Namespace(namespace).
 		SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
-			Command: command,
-			Stdin:   false,
-			Stdout:  true,
-			Stderr:  true,
-			TTY:     false,
+			Command:   command,
+			Container: containerName,
+			Stdin:     false,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       false,
 		}, scheme.ParameterCodec)
 
 	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
@@ -111,31 +97,41 @@ func execCommandInPod(clientset *kubernetes.Clientset, config *rest.Config, name
 	return stdout.String(), nil
 }
 
-// handleExecCommand provides an HTTP endpoint for executing commands in a pod.
+// handleExecCommand provides an HTTP endpoint for executing commands in a Kubernetes pod
 func handleExecCommand(clientset *kubernetes.Clientset, config *rest.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Define namespace and labels
 		namespace := "default"
 		labelSelector := "app.kubernetes.io/component=useradm"
 
-		// Fetch the pod where the command will be executed
-		podName, err := fetchPodByName(clientset, namespace, labelSelector)
+		pod, err := fetchPodByName(clientset, namespace, labelSelector)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Define the command to be executed inside the pod
-		command := []string{"/bin/sh", "-c", "useradm create-user --username 'demo@mender.io' --password 'demodemo'"}
+		// Attempt to find the correct container by excluding common sidecar containers like Linkerd
+		containerName := ""
+		for _, container := range pod.Spec.Containers {
+			if container.Name != "linkerd-proxy" { // Exclude the Linkerd proxy
+				containerName = container.Name
+				break
+			}
+		}
 
-		// Execute the command in the fetched pod
-		output, execErr := execCommandInPod(clientset, config, namespace, podName, command)
+		if containerName == "" {
+			http.Error(w, "No appropriate container found", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("Selected container: %s", containerName)
+		command := []string{"/usr/bin/useradm", "create-user", "--username", "demo@mender.com", "--password", "demodemo"}
+
+		output, execErr := execCommandInPod(clientset, config, namespace, pod.Name, containerName, command)
 		if execErr != nil {
 			http.Error(w, execErr.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Send the output back to the client
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(output))
 	}

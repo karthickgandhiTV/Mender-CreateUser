@@ -1,0 +1,45 @@
+cat > createuser.yaml << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mender-usercreate-deployment
+  labels:
+    app: mender-usercreate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mender-usercreate
+  template:
+    metadata:
+      labels:
+        app: mender-usercreate
+    spec:
+      containers:
+      - name: mender-usercreate
+        image: karthickgandhi06/mender
+        ports:
+        - containerPort: 8080
+        imagePullPolicy: Always
+
+EOF
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mender-usercreate-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mender-usercreate
+  template:
+    metadata:
+      labels:
+        app: mender-usercreate
+    spec:
+      containers:
+      - name: mender-usercreate
+        image: new-image-name:tag
+        imagePullPolicy: Always  # Ensure the latest image is always pulled
