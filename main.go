@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,20 +16,29 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
+type UserCredentials struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type UserCreationResponse struct {
+	Message string `json:"UUID"`
+	Error   string `json:"error"`
+}
+
 func main() {
 	clientset, config, err := initializeClient()
 	if err != nil {
 		log.Fatalf("Error initializing Kubernetes client: %v", err)
 	}
 
-	http.HandleFunc("/exec-command", handleExecCommand(clientset, config))
+	http.HandleFunc("/signup", handleExecCommand(clientset, config))
 	log.Println("Starting server on port 8080...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Failed to start HTTP server: %v", err)
 	}
 }
 
-// initializeClient sets up the Kubernetes client using in-cluster configuration
 func initializeClient() (*kubernetes.Clientset, *rest.Config, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -43,7 +53,6 @@ func initializeClient() (*kubernetes.Clientset, *rest.Config, error) {
 	return clientset, config, nil
 }
 
-// fetchPodByName finds the first pod matching the label selector in the specified namespace
 func fetchPodByName(clientset *kubernetes.Clientset, namespace, labelSelector string) (*corev1.Pod, error) {
 	pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
 		LabelSelector: labelSelector,
@@ -58,7 +67,6 @@ func fetchPodByName(clientset *kubernetes.Clientset, namespace, labelSelector st
 	return &pods.Items[0], nil
 }
 
-// execCommandInPod runs a specified command in a pod/container within the given namespace
 func execCommandInPod(clientset *kubernetes.Clientset, config *rest.Config, namespace, podName, containerName string, command []string) (string, error) {
 	req := clientset.CoreV1().RESTClient().
 		Post().
@@ -90,18 +98,30 @@ func execCommandInPod(clientset *kubernetes.Clientset, config *rest.Config, name
 		return "", fmt.Errorf("failed to execute command: %v", err)
 	}
 
-	if stderr.Len() > 0 {
-		return "", fmt.Errorf("command error: %s", stderr.String())
-	}
-
-	return stdout.String(), nil
+	return stdout.String(), fmt.Errorf(stderr.String())
 }
 
-// handleExecCommand provides an HTTP endpoint for executing commands in a Kubernetes pod
 func handleExecCommand(clientset *kubernetes.Clientset, config *rest.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
 		namespace := "default"
 		labelSelector := "app.kubernetes.io/component=useradm"
+		decoder := json.NewDecoder(r.Body)
+		var creds UserCredentials
+
+		if err := decoder.Decode(&creds); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if creds.Email == "" || creds.Password == "" {
+			http.Error(w, "Email and password must not be empty", http.StatusBadRequest)
+			return
+		}
 
 		pod, err := fetchPodByName(clientset, namespace, labelSelector)
 		if err != nil {
@@ -109,10 +129,9 @@ func handleExecCommand(clientset *kubernetes.Clientset, config *rest.Config) htt
 			return
 		}
 
-		// Attempt to find the correct container by excluding common sidecar containers like Linkerd
 		containerName := ""
 		for _, container := range pod.Spec.Containers {
-			if container.Name != "linkerd-proxy" { // Exclude the Linkerd proxy
+			if container.Name != "linkerd-proxy" {
 				containerName = container.Name
 				break
 			}
@@ -124,15 +143,17 @@ func handleExecCommand(clientset *kubernetes.Clientset, config *rest.Config) htt
 		}
 
 		log.Printf("Selected container: %s", containerName)
-		command := []string{"/usr/bin/useradm", "create-user", "--username", "demo@mender.com", "--password", "demodemo"}
+		command := []string{"/usr/bin/useradm", "create-user", "--username", creds.Email, "--password", creds.Password}
 
 		output, execErr := execCommandInPod(clientset, config, namespace, pod.Name, containerName, command)
-		if execErr != nil {
-			http.Error(w, execErr.Error(), http.StatusInternalServerError)
-			return
-		}
 
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(output))
+		var response UserCreationResponse
+		if execErr != nil {
+			response.Error = execErr.Error()
+		}
+		response.Message = output
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
 	}
 }
