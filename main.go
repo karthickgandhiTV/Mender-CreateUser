@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
+	"os"
+	"os/signal"
 
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -32,11 +35,48 @@ func main() {
 		log.Fatalf("Error initializing Kubernetes client: %v", err)
 	}
 
-	http.HandleFunc("/signup", handleExecCommand(clientset, config))
-	log.Println("Starting server on port 8080...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("Failed to start HTTP server: %v", err)
+	nc, err := nats.Connect("connect.ngs.global", nats.UserCredentials("NGS-Karthick-karthick.creds"), nats.Name("Mender Consumer"))
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx := context.Background()
+	stream, err := js.Stream(ctx, "MenderUser")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Name:    "mender_users",
+		Durable: "mender_users",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	cctx, err := consumer.Consume(func(msgs jetstream.Msg) {
+		var creds UserCredentials
+		if err := json.Unmarshal(msgs.Data(), &creds); err != nil {
+			log.Printf("Error decoding user credentials: %v", err)
+			msgs.Nak()
+			return
+		}
+
+		handleUserSignup(clientset, config, creds)
+		msgs.Ack()
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer cctx.Stop()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
 }
 
 func initializeClient() (*kubernetes.Clientset, *rest.Config, error) {
@@ -101,59 +141,39 @@ func execCommandInPod(clientset *kubernetes.Clientset, config *rest.Config, name
 	return stdout.String(), fmt.Errorf(stderr.String())
 }
 
-func handleExecCommand(clientset *kubernetes.Clientset, config *rest.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
-			return
-		}
+func handleUserSignup(clientset *kubernetes.Clientset, config *rest.Config, creds UserCredentials) {
+	namespace := "default"
+	labelSelector := "app.kubernetes.io/component=useradm"
 
-		namespace := "default"
-		labelSelector := "app.kubernetes.io/component=useradm"
-		decoder := json.NewDecoder(r.Body)
-		var creds UserCredentials
-
-		if err := decoder.Decode(&creds); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		if creds.Email == "" || creds.Password == "" {
-			http.Error(w, "Email and password must not be empty", http.StatusBadRequest)
-			return
-		}
-
-		pod, err := fetchPodByName(clientset, namespace, labelSelector)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		containerName := ""
-		for _, container := range pod.Spec.Containers {
-			if container.Name != "linkerd-proxy" {
-				containerName = container.Name
-				break
-			}
-		}
-
-		if containerName == "" {
-			http.Error(w, "No appropriate container found", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Selected container: %s", containerName)
-		command := []string{"/usr/bin/useradm", "create-user", "--username", creds.Email, "--password", creds.Password}
-
-		output, execErr := execCommandInPod(clientset, config, namespace, pod.Name, containerName, command)
-
-		var response UserCreationResponse
-		if execErr != nil {
-			response.Error = execErr.Error()
-		}
-		response.Message = output
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+	pod, err := fetchPodByName(clientset, namespace, labelSelector)
+	if err != nil {
+		log.Printf("Error fetching pod: %v", err)
+		return
 	}
+
+	containerName := ""
+	for _, container := range pod.Spec.Containers {
+		if container.Name != "linkerd-proxy" {
+			containerName = container.Name
+			break
+		}
+	}
+
+	if containerName == "" {
+		log.Println("No appropriate container found")
+		return
+	}
+
+	log.Printf("Selected container: %s", containerName)
+	command := []string{"/usr/bin/useradm", "create-user", "--username", creds.Email, "--password", creds.Password}
+	output, execErr := execCommandInPod(clientset, config, namespace, pod.Name, containerName, command)
+
+	var response UserCreationResponse
+	if execErr != nil {
+		response.Error = execErr.Error()
+	}
+	response.Message = output
+
+	// Log the response or handle it further if needed
+	log.Printf("User creation response: %+v", response)
 }

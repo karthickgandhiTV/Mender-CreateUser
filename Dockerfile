@@ -10,10 +10,14 @@ COPY go.mod go.sum ./
 # Download dependencies
 RUN go mod download
 
+# Optionally tidy up the dependencies
 RUN go mod tidy
 
-# Copy the source code and the credentials file into the container
+# Copy the source code into the container
 COPY . .
+
+# Copy the NATS credentials file
+COPY NGS-Karthick-karthick.creds ./
 
 # Build the Go application
 RUN CGO_ENABLED=0 GOOS=linux go build -o mender-usercreate .
@@ -30,11 +34,13 @@ WORKDIR /root/
 # Copy the built executable from the builder stage
 COPY --from=builder /app/mender-usercreate .
 
+# Copy the NATS credentials file from the builder stage
+COPY --from=builder /app/NGS-Karthick-karthick.creds .
 
 # Expose the port that your application listens on (if any)
 # Update the port according to your application's requirements
 # EXPOSE 4222 is usually for NATS server; adjust if your application provides an HTTP/other service interface
-EXPOSE 8080
+EXPOSE 4222
 
 # Command to run the executable
 CMD ["./mender-usercreate"]
